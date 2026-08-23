@@ -90,6 +90,24 @@ def sync_chats(state):
 
 # ---------- Merriam-Webster ----------
 
+def extract_mw_example(description_html):
+    """Pull the first illustrative example sentence out of MW's RSS description
+    field. That field holds an extended explanation followed by one or more
+    example sentences separated by '//'. Take the first example, and stop at
+    an em-dash attribution (e.g. '-- Some Author, Some Magazine') if one shows
+    up, since those quote outside publications rather than being MW's own
+    editorial example."""
+    if not description_html:
+        return None
+    soup = BeautifulSoup(description_html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    parts = [p.strip() for p in text.split("//") if p.strip()]
+    if len(parts) < 2:
+        return None
+    example = re.split(r"\s+—\s+", parts[1])[0].strip()
+    return example or None
+
+
 def fetch_merriam_webster():
     """Merriam-Webster publishes an official RSS feed for word of the day,
     including a clean short definition field -- no scraping needed."""
@@ -104,8 +122,9 @@ def fetch_merriam_webster():
     link = item.findtext("link", "").strip()
     ns = {"merriam": "https://www.merriam-webster.com/word-of-the-day"}
     definition = item.findtext("merriam:shortdef", default="", namespaces=ns).strip()
+    example = extract_mw_example(item.findtext("description", ""))
 
-    return {"word": word, "definition": definition, "link": link}
+    return {"word": word, "definition": definition, "link": link, "example": example}
 
 
 # ---------- Oxford ----------
@@ -151,15 +170,20 @@ def format_message(mw, ox):
     parts = ["📖 *Word of the Day*"]
 
     if mw:
-        parts.append(
+        block = (
             f"\n🇺🇸 *Merriam-Webster:* {escape_markdown(mw['word'])}\n"
-            f"{escape_markdown(mw['definition'])}\n"
-            f"[Full entry]({mw['link']})"
+            f"{escape_markdown(mw['definition'])}"
         )
+        if mw.get("example"):
+            block += f"\n_e.g. {escape_markdown(mw['example'])}_"
+        block += f"\n[Full entry]({mw['link']})"
+        parts.append(block)
     else:
         parts.append("\n🇺🇸 *Merriam-Webster:* _couldn't fetch today's word_")
 
     if ox:
+        # Oxford's source (see fetch_oxford) only ever provides a definition,
+        # no example sentence -- nothing to add here even when it succeeds.
         parts.append(
             f"\n🇬🇧 *Oxford:* {escape_markdown(ox['word'])}\n"
             f"{escape_markdown(ox['definition'])}"
