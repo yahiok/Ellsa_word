@@ -1,0 +1,42 @@
+name: Send Word of the Day
+
+on:
+  schedule:
+    # 06:00 UTC daily = 9:30 AM Iran Standard Time.
+    # Both dictionaries have posted their new word well before this
+    # (Merriam-Webster updates at 05:00 UTC). Adjust freely --
+    # https://crontab.guru is handy for editing this.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}  # lets you trigger a run manually from the Actions tab, for testing
+
+permissions:
+  contents: write  # needed so the workflow can commit the updated chats.json back to the repo
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python main.py
+
+      - name: Save updated chat list
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add chats.json
+          git diff --staged --quiet || git commit -m "Update chat list [skip ci]"
+          git pull --rebase origin main
+          git push
