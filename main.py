@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -90,27 +91,37 @@ def sync_chats(state):
 
 # ---------- Merriam-Webster ----------
 
-def extract_mw_example(description_html):
-    """Pull the first illustrative example sentence out of MW's RSS description
-    field. That field holds an extended explanation followed by one or more
-    example sentences separated by '//'. Take the first example, and stop at
-    an em-dash attribution (e.g. '-- Some Author, Some Magazine') if one shows
-    up, since those quote outside publications rather than being MW's own
-    editorial example."""
-    if not description_html:
-        return None
-    soup = BeautifulSoup(description_html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-    parts = [p.strip() for p in text.split("//") if p.strip()]
-    if len(parts) < 2:
-        return None
-    example = re.split(r"\s+—\s+", parts[1])[0].strip()
-    return example or None
+def render_inline(tag):
+    """Convert a BeautifulSoup tag's content to Telegram-HTML-safe text,
+    turning MW's <em> emphasis into Telegram's <i> tag instead of flattening
+    it to plain text. MW uses <em> both on the featured word itself
+    (wherever it appears in an example) and on the publication/book title
+    in a citation -- this preserves both."""
+    parts = []
+    for node in tag.children:
+        if isinstance(node, str):
+            parts.append(escape_html(str(node)))
+        elif getattr(node, "name", None) == "em":
+            parts.append(f"<i>{escape_html(node.get_text(' ', strip=True))}</i>")
+        else:
+            parts.append(escape_html(node.get_text(" ", strip=True)))
+    text = "".join(parts)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def fetch_merriam_webster():
-    """Merriam-Webster publishes an official RSS feed for word of the day,
-    including a clean short definition field -- no scraping needed."""
+    """Merriam-Webster's RSS feed description field, per item, holds:
+      - MW's own one-or-more illustrative example sentences, each in a
+        <p> starting with '//'
+      - exactly one real "Examples:" section: a quoted excerpt from an
+        actual publication, with a source attribution
+
+    Note: the feed's HTML nests <p> tags inside <p> tags, which is invalid
+    HTML -- Python's html.parser keeps that nesting literally rather than
+    auto-closing it, so the "Examples:" quote is a *child* of its label's
+    parent <p>, not a following sibling. (Verified against the live feed;
+    see the parser test this was built against.)
+    """
     resp = requests.get(MW_FEED_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -122,9 +133,57 @@ def fetch_merriam_webster():
     link = item.findtext("link", "").strip()
     ns = {"merriam": "https://www.merriam-webster.com/word-of-the-day"}
     definition = item.findtext("merriam:shortdef", default="", namespaces=ns).strip()
-    example = extract_mw_example(item.findtext("description", ""))
 
-    return {"word": word, "definition": definition, "link": link, "example": example}
+    date = None
+    pub_date_raw = item.findtext("pubDate", "").strip()
+    if pub_date_raw:
+        try:
+            dt = parsedate_to_datetime(pub_date_raw)
+            date = f"{dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}, {dt.year}"
+        except Exception:
+            date = None
+
+    description_html = item.findtext("description", "") or ""
+    soup = BeautifulSoup(description_html, "html.parser")
+
+    # Pronunciation sits as plain text between the word's own <strong> tag
+    # and the part-of-speech <em> tag, e.g.:
+    #   <strong>prowess</strong> • \PROW-us\  • <em>noun</em><br/>
+    # -- not every word necessarily has one, so this stays None if absent.
+    pronunciation = None
+    word_strong = soup.find("strong", string=lambda s: s and s.strip().lower() == word.lower())
+    if word_strong:
+        for sib in word_strong.next_siblings:
+            name = getattr(sib, "name", None)
+            if name in ("br", "p"):
+                break
+            if isinstance(sib, str):
+                match = re.search(r"\\(.+?)\\", sib)
+                if match:
+                    pronunciation = match.group(1).strip()
+                    break
+
+    examples = []
+    for p in soup.find_all("p"):
+        if p.get_text(" ", strip=True).startswith("//"):
+            examples.append(re.sub(r"^/+\s*", "", render_inline(p)))
+
+    in_context = None
+    label = soup.find("strong", string=re.compile(r"^\s*Examples:?\s*$"))
+    if label and label.parent:
+        quote_p = label.parent.find("p")
+        if quote_p:
+            in_context = render_inline(quote_p)
+
+    return {
+        "word": word,
+        "pronunciation": pronunciation,
+        "definition": definition,
+        "link": link,
+        "examples": examples,
+        "in_context": in_context,
+        "date": date,
+    }
 
 
 # ---------- Oxford ----------
@@ -161,35 +220,47 @@ def fetch_oxford():
 
 # ---------- messaging ----------
 
-def escape_markdown(text):
-    """Escape characters that have special meaning in Telegram's (legacy) Markdown."""
-    return re.sub(r"([_*`\[])", r"\\\1", text)
+def escape_html(text):
+    """Escape characters with special meaning in Telegram's HTML parse mode."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def format_message(mw, ox):
-    parts = ["📖 *Word of the Day*"]
+    header = "📖 <b>Word of the Day</b>"
+    if mw and mw.get("date"):
+        header += f" — {escape_html(mw['date'])}"
+    parts = [header]
 
     if mw:
-        block = (
-            f"\n🇺🇸 *Merriam-Webster:* {escape_markdown(mw['word'])}\n"
-            f"{escape_markdown(mw['definition'])}"
-        )
-        if mw.get("example"):
-            block += f"\n_e.g. {escape_markdown(mw['example'])}_"
-        block += f"\n[Full entry]({mw['link']})"
+        word_line = f"🇺🇸 <b>Merriam-Webster:</b> {escape_html(mw['word'])}"
+        if mw.get("pronunciation"):
+            word_line += f" <i>\\{escape_html(mw['pronunciation'])}\\</i>"
+        block = f"\n{word_line}\n{escape_html(mw['definition'])}"
+        # MW usually gives one editorial example, occasionally two or more.
+        for ex in mw.get("examples") or []:
+            block += f"\n<i>e.g. {ex}</i>"
+        # The "Examples:" section is real published usage, not MW's own
+        # writing -- keep it visually separated with a blank line, and
+        # keep its source attribution (already part of in_context).
+        if mw.get("in_context"):
+            word_label = escape_html(mw["word"].capitalize())
+            block += f"\n\n<b>{word_label} in Context:</b> {mw['in_context']}"
+        block += f'\n<a href="{escape_html(mw["link"])}">Full entry</a>'
         parts.append(block)
     else:
-        parts.append("\n🇺🇸 *Merriam-Webster:* _couldn't fetch today's word_")
+        parts.append("\n🇺🇸 <b>Merriam-Webster:</b> <i>couldn't fetch today's word</i>")
 
     if ox:
         # Oxford's source (see fetch_oxford) only ever provides a definition,
         # no example sentence -- nothing to add here even when it succeeds.
         parts.append(
-            f"\n🇬🇧 *Oxford:* {escape_markdown(ox['word'])}\n"
-            f"{escape_markdown(ox['definition'])}"
+            f"\n🇬🇧 <b>Oxford:</b> {escape_html(ox['word'])}\n"
+            f"{escape_html(ox['definition'])}"
         )
     else:
-        parts.append("\n🇬🇧 *Oxford:* _couldn't fetch today's word_")
+        parts.append("\n🇬🇧 <b>Oxford:</b> <i>couldn't fetch today's word</i>")
+
+    parts.append("\n@ELLSA_FUM\n@EllsaWordOfTheDayBot")
 
     return "\n".join(parts)
 
@@ -200,7 +271,7 @@ def send_message(chat_id, text):
         data={
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         },
         timeout=15,
