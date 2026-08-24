@@ -2,7 +2,7 @@ name: Send Word of the Day
 
 on:
   schedule:
-    # 06:00 UTC daily = 9:30 AM Iran Standard Time.
+    # 06:17 UTC daily = 9:47 AM Iran Standard Time.
     # Both dictionaries have posted their new word well before this
     # (Merriam-Webster updates at 05:00 UTC). Adjust freely --
     # https://crontab.guru is handy for editing this.
